@@ -2,6 +2,14 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 
+declare global {
+  interface Window {
+    umami?: {
+      track: (eventName: string, data?: Record<string, string | number | boolean>) => void;
+    };
+  }
+}
+
 type Status = 'idle' | 'recording' | 'transcribing' | 'editing' | 'done' | 'error';
 type LanguageOption = 'auto' | 'en' | 'ja';
 type RecordingMode = 'ptt' | 'toggle';
@@ -64,6 +72,32 @@ interface CaretRange {
   end: number;
 }
 
+type TrackProps = Record<string, string | number | boolean>;
+
+function track(eventName: string, data?: TrackProps) {
+  try {
+    window.umami?.track(eventName, data);
+  } catch {
+    // noop
+  }
+}
+
+function classifyError(err: unknown) {
+  const msg = err instanceof Error ? err.message.toLowerCase() : '';
+
+  if (msg.includes('401') || msg.includes('unauthorized') || msg.includes('invalid api key')) {
+    return 'auth_error';
+  }
+  if (msg.includes('429') || msg.includes('rate')) {
+    return 'rate_limit';
+  }
+  if (msg.includes('network') || msg.includes('fetch')) {
+    return 'network_error';
+  }
+
+  return 'unknown';
+}
+
 function maskSecret(secret: string) {
   return secret ? '••••••' : 'not set';
 }
@@ -104,6 +138,8 @@ export default function Home() {
   const recordingStartedAtRef = useRef<number | null>(null);
   const silenceStartedAtRef = useRef<number | null>(null);
   const waveformFrameCountRef = useRef(0);
+  const hadAquaKeyRef = useRef(false);
+  const hadOpenAiKeyRef = useRef(false);
 
   useEffect(() => {
     try {
@@ -124,6 +160,21 @@ export default function Home() {
     if (!settingsReady) return;
     window.localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(settings));
   }, [settingsReady, settings]);
+
+  useEffect(() => {
+    const hasAqua = !!settings.aquaApiKey.trim();
+    const hasOpenAi = !!settings.openaiApiKey.trim();
+
+    if (!hadAquaKeyRef.current && hasAqua) {
+      track('api_key_saved_aqua');
+    }
+    if (!hadOpenAiKeyRef.current && hasOpenAi) {
+      track('api_key_saved_openai');
+    }
+
+    hadAquaKeyRef.current = hasAqua;
+    hadOpenAiKeyRef.current = hasOpenAi;
+  }, [settings.aquaApiKey, settings.openaiApiKey]);
 
   const updateSetting = useCallback(<K extends keyof AppSettings>(key: K, value: AppSettings[K]) => {
     setSettings((prev) => ({ ...prev, [key]: value }));
@@ -174,6 +225,7 @@ export default function Home() {
   }, []);
 
   const handleRestoreSnapshot = useCallback((snapshot: string) => {
+    track('history_restore');
     setTranscript(snapshot);
   }, []);
 
@@ -330,6 +382,10 @@ export default function Home() {
         };
 
         mediaRecorder.start();
+        track(mode === 'ptt' ? 'record_start_ptt' : 'record_start_toggle', {
+          language: settings.language,
+          edit_mode: !!editRangeRef.current,
+        });
         setStatus('recording');
         setErrorMsg('');
       } catch {
@@ -340,11 +396,12 @@ export default function Home() {
         textareaHadFocusRef.current = false;
         stopMicMonitoring();
         setEditModeActive(false);
+        track('mic_permission_denied');
         setErrorMsg('Microphone access denied. Please allow microphone access and try again.');
         setStatus('error');
       }
     },
-    [settings.aquaApiKey, settings.openaiApiKey, startMicMonitoring, stopMicMonitoring],
+    [settings.aquaApiKey, settings.language, settings.openaiApiKey, startMicMonitoring, stopMicMonitoring],
   );
 
   const stopRecording = useCallback(async () => {
@@ -359,10 +416,15 @@ export default function Home() {
     setStatus('transcribing');
 
     mediaRecorder.onstop = async () => {
+      const stoppedMode = recordingModeRef.current;
       isRecordingRef.current = false;
       recordingModeRef.current = null;
       streamRef.current?.getTracks().forEach((t) => t.stop());
       stopMicMonitoring();
+
+      if (!micHasSignal) {
+        track('no_mic_signal', { mode: stoppedMode ?? 'unknown' });
+      }
 
       const mimeType = mediaRecorder.mimeType || 'audio/webm';
       const blob = new Blob(chunksRef.current, { type: mimeType });
@@ -390,9 +452,32 @@ export default function Home() {
         const instruction = data.text as string;
         const range = editRangeRef.current;
 
+        if (!instruction.trim()) {
+          track('transcription_empty', {
+            mode: stoppedMode ?? 'unknown',
+            language: settings.language,
+          });
+        } else {
+          track('transcription_success', {
+            mode: stoppedMode ?? 'unknown',
+            language: settings.language,
+            edit_mode: !!range,
+          });
+        }
+
         if (range) {
           setStatus('editing');
-          const replacement = await runClientSideEdit(range.selectedText, instruction);
+          let replacement: string;
+          try {
+            replacement = await runClientSideEdit(range.selectedText, instruction);
+            track('ai_edit_success', { language: settings.language });
+          } catch (err) {
+            track('ai_edit_error', {
+              type: classifyError(err),
+              language: settings.language,
+            });
+            throw err;
+          }
           const nextTranscript = snapshotBeforeEdit.slice(0, range.start) + replacement + snapshotBeforeEdit.slice(range.end);
           pendingCaretRangeRef.current = {
             start: range.start + replacement.length,
@@ -462,6 +547,10 @@ export default function Home() {
         textareaHadFocusRef.current = false;
         pendingCaretRangeRef.current = null;
         setEditModeActive(false);
+        track('transcription_error', {
+          type: classifyError(err),
+          mode: stoppedMode ?? 'unknown',
+        });
         setErrorMsg(err instanceof Error ? err.message : 'Transcription failed');
         setStatus('error');
       }
@@ -478,6 +567,7 @@ export default function Home() {
     settings.language,
     stopMicMonitoring,
     transcript,
+    micHasSignal,
   ]);
 
   useEffect(() => () => {
@@ -504,6 +594,7 @@ export default function Home() {
   const handleCopy = useCallback(async () => {
     try {
       await navigator.clipboard.writeText(transcript);
+      track('clipboard_copy');
       setCopied(true);
       setTimeout(() => setCopied(false), 3000);
     } catch {
@@ -556,7 +647,10 @@ export default function Home() {
     <>
       <button
         type="button"
-        onClick={() => setSettingsOpen(true)}
+        onClick={() => {
+          track('settings_open');
+          setSettingsOpen(true);
+        }}
         className="fixed left-4 top-4 z-30 rounded-xl border border-gray-800 bg-gray-900/95 px-3 py-2 text-sm text-gray-300 shadow-lg shadow-black/30 transition hover:border-gray-700 hover:text-white"
       >
         ⚙️ Settings
@@ -699,7 +793,13 @@ export default function Home() {
               <p>OpenAI: {maskSecret(settings.openaiApiKey)}</p>
               <p className="mt-2">This app is designed to be static-host friendly: HTML, JavaScript, and CSS only.</p>
             </div>
-            <a href="https://ko-fi.com/Z8Z11Z232Z" target="_blank" rel="noreferrer" className="flex justify-center">
+            <a
+              href="https://ko-fi.com/Z8Z11Z232Z"
+              target="_blank"
+              rel="noreferrer"
+              className="flex justify-center"
+              onClick={() => track('kofi_click')}
+            >
               {/* eslint-disable-next-line @next/next/no-img-element */}
               <img height="36" style={{ border: '0px', height: '36px' }} src="https://storage.ko-fi.com/cdn/kofi6.png?v=6" alt="Buy Me a Coffee at ko-fi.com" />
             </a>
@@ -716,6 +816,7 @@ export default function Home() {
             target="_blank"
             rel="noreferrer"
             className="mb-3 text-xs text-gray-600 hover:text-gray-400 transition-colors"
+            onClick={() => track('github_click')}
           >
             GitHub
           </a>
